@@ -3,8 +3,8 @@ FROM jenkins/jenkins:lts-jdk17
 USER root
 
 # The Docker CLI only. The daemon stays on the host, reached through the
-# mounted socket. This is "Docker outside of Docker" -- far simpler and
-# safer than running a second daemon inside the container.
+# mounted socket. This is "Docker outside of Docker" -- simpler and safer
+# than running a second daemon inside the container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg lsb-release \
     && install -m 0755 -d /etc/apt/keyrings \

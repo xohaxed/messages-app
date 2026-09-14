@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 msg.json
+
+.qodo/
+jenkins/jenkins-home/

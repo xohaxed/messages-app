@@ -1,0 +1,128 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = 'messages-app'
+        IMAGE_TAG  = "${env.BUILD_NUMBER}"
+        TEST_DB    = "test-db-${env.BUILD_NUMBER}"
+        TEST_NET   = "test-net-${env.BUILD_NUMBER}"
+        COMPOSE_PROJECT_NAME = 'messages-app'
+    }
+
+    options {
+        timeout(time: 15, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'ls -la'
+            }
+        }
+
+        stage('Build image') {
+            steps {
+                // Tagged with the build number, never only :latest. Without a
+                // unique tag you cannot roll back and cannot answer "which
+                // version is running in production?"
+                sh """
+                    docker build -f docker/Dockerfile \
+                        -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                        -t ${IMAGE_NAME}:latest .
+                """
+            }
+        }
+
+        stage('Test') {
+            steps {
+                withCredentials([string(credentialsId: 'messages-db-password',
+                                        variable: 'DB_PASSWORD')]) {
+                    sh """
+                        docker network create ${TEST_NET}
+
+                        docker run -d --name ${TEST_DB} --network ${TEST_NET} \
+                            -e POSTGRES_DB=messages_db \
+                            -e POSTGRES_USER=messages_app \
+                            -e POSTGRES_PASSWORD=\$DB_PASSWORD \
+                            postgres:16-alpine
+
+                        # Wait for readiness. Never `sleep 10` and hope.
+                        for i in \$(seq 1 30); do
+                            docker exec ${TEST_DB} pg_isready -U messages_app -d messages_db && break
+                            sleep 1
+                        done
+
+                        # Copy the schema in rather than bind-mounting it: the
+                        # daemon resolves mount paths against the HOST, and the
+                        # Jenkins workspace path does not exist there.
+                        docker cp db/init.sql ${TEST_DB}:/tmp/init.sql
+                        docker exec ${TEST_DB} psql -U messages_app -d messages_db -f /tmp/init.sql
+
+                        docker create --name test-run-${IMAGE_TAG} --network ${TEST_NET} \
+                            -e DB_HOST=${TEST_DB} -e DB_PORT=5432 \
+                            -e DB_NAME=messages_db -e DB_USER=messages_app \
+                            -e DB_PASSWORD=\$DB_PASSWORD \
+                            --entrypoint sh ${IMAGE_NAME}:${IMAGE_TAG} \
+                            -c "pip install --quiet pytest httpx && python -m pytest /app/tests -v"
+
+                        docker cp tests test-run-${IMAGE_TAG}:/app/tests
+                        docker start -a test-run-${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                withCredentials([string(credentialsId: 'messages-db-password',
+                                        variable: 'DB_PASSWORD')]) {
+                    // Explicit -f: the dev override must NOT load here.
+                    sh """
+                        export DB_NAME=messages_db
+                        export DB_USER=messages_app
+                        export APP_ENV=prod
+                        export APP_PORT=5000
+                        export APP_VERSION=${IMAGE_TAG}
+                        docker compose -f docker-compose.yml up -d --no-build
+                    """
+                }
+            }
+        }
+
+        stage('Smoke test') {
+            steps {
+                // A deploy that is not verified is not a deploy.
+                sh '''
+                    for i in $(seq 1 30); do
+                        code=$(docker run --rm --network messages-app_messages-net \
+                            curlimages/curl:latest -s -o /dev/null -w "%{http_code}" \
+                            http://messages-api:5000/health || echo "000")
+                        if [ "$code" = "200" ]; then
+                            echo "smoke test passed"
+                            exit 0
+                        fi
+                        sleep 2
+                    done
+                    echo "smoke test FAILED"
+                    exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            // Runs whether the build passed or failed. Without this, failing
+            // builds leak containers and networks forever.
+            sh """
+                docker rm -f ${TEST_DB} test-run-${IMAGE_TAG} || true
+                docker network rm ${TEST_NET} || true
+            """
+        }
+        success { echo "Build ${IMAGE_TAG} deployed" }
+        failure { echo "Build ${IMAGE_TAG} FAILED" }
+    }
+}
