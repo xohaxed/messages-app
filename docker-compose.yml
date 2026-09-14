@@ -1,0 +1,66 @@
+# Production-shaped stack. No bind mounts, no --reload, code baked into the
+# image. Development conveniences live in docker-compose.override.yml, which
+# Compose merges automatically for `docker compose up` and which is skipped
+# when the file is named explicitly:
+#   docker compose -f docker-compose.yml up -d     <- what the server runs
+#
+# No `version:` key -- obsolete in Compose v2 and emits a warning.
+
+services:
+  messages-db:
+    image: postgres:16-alpine
+    container_name: messages-db
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - messages-data:/var/lib/postgresql/data
+      # Runs ONLY when the data directory is empty. Once the volume has
+      # data, Postgres skips this folder entirely -- which is why real
+      # projects need migrations, not an init script.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5433:5432"
+    networks:
+      - messages-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  messages-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: messages-app:${APP_VERSION:-0.2.0}
+    container_name: messages-api
+    environment:
+      DB_HOST: messages-db      # service name, resolved by Docker's DNS
+      DB_PORT: 5432             # internal port, not the 5433 host mapping
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      APP_ENV: ${APP_ENV}
+    ports:
+      - "${APP_PORT:-5000}:5000"
+    networks:
+      - messages-net
+    restart: unless-stopped
+    depends_on:
+      messages-db:
+        # Plain depends_on waits for the container to START, not to be
+        # READY. This waits for pg_isready to pass. It governs STARTUP only:
+        # a database that dies at 3am is still the app's problem, which is
+        # what the 503 handler in app/main.py is for.
+        condition: service_healthy
+
+volumes:
+  messages-data:
+
+networks:
+  messages-net:
+    driver: bridge

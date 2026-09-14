@@ -1,0 +1,13 @@
+# Development only. Compose merges this automatically on `docker compose up`.
+# Source is bind-mounted and uvicorn reloads on change -- no rebuild needed.
+# The server never loads this file because Stage 5 deploys with:
+#   docker compose -f docker-compose.yml up -d
+
+services:
+  messages-api:
+    volumes:
+      - ./app:/app/app:ro
+    command:
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5000", "--reload"]
+    environment:
+      APP_ENV: dev
